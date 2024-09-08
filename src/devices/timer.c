@@ -30,13 +30,31 @@ static void busy_wait (int64_t loops);
 static void real_time_sleep (int64_t num, int32_t denom);
 static void real_time_delay (int64_t num, int32_t denom);
 
+/* Global list of sleeping threads. */
+static struct list sleeping_list;
+
+/* Structure to store sleeping thread and wake-up time. */
+struct sleeping_thread {
+    struct thread *t;            // The sleeping thread.
+    int64_t wake_up_time;        // Time when the thread should wake up.
+    struct list_elem elem;       // List element to store in the sleeping list.
+};
+
+/* Comparator to order threads by wake-up time. */
+bool compare_wake_time(const struct list_elem *a, const struct list_elem *b, void *aux UNUSED) {
+    const struct sleeping_thread *thread_a = list_entry(a, struct sleeping_thread, elem);
+    const struct sleeping_thread *thread_b = list_entry(b, struct sleeping_thread, elem);
+    return thread_a->wake_up_time < thread_b->wake_up_time;
+}
+
 /* Sets up the timer to interrupt TIMER_FREQ times per second,
    and registers the corresponding interrupt. */
 void
-timer_init (void) 
+timer_init (void)
 {
-  pit_configure_channel (0, 2, TIMER_FREQ);
-  intr_register_ext (0x20, timer_interrupt, "8254 Timer");
+  //pit_configure_channel (0, 2, TIMER_FREQ);
+  //intr_register_ext (0x20, timer_interrupt, "8254 Timer");
+  list_init(&sleeping_list);   // Initialize the sleeping list.
 }
 
 /* Calibrates loops_per_tick, used to implement brief delays. */
@@ -86,14 +104,31 @@ timer_elapsed (int64_t then)
 
 /* Sleeps for approximately TICKS timer ticks.  Interrupts must
    be turned on. */
+/* Reimplementation of timer_sleep() to avoid busy waiting. */
 void
 timer_sleep (int64_t ticks) 
 {
-  int64_t start = timer_ticks ();
+  //int64_t start = timer_ticks ();
 
-  ASSERT (intr_get_level () == INTR_ON);
-  while (timer_elapsed (start) < ticks) 
-    thread_yield ();
+  //ASSERT (intr_get_level () == INTR_ON);
+  //while (timer_elapsed (start) < ticks)
+  //  thread_yield ();
+    int64_t start = timer_ticks();  // Get the current time.
+    int64_t wake_up_time = start + ticks;  // Calculate the wake-up time.
+
+    ASSERT (intr_get_level () == INTR_ON);  // Ensure interrupts are enabled.
+
+    struct sleeping_thread st;
+    st.t = thread_current();      // Get the current thread.
+    st.wake_up_time = wake_up_time;  // Set the wake-up time.
+
+    enum intr_level old_level = intr_disable();  // Disable interrupts briefly.
+
+    list_insert_ordered(&sleeping_list, &st.elem, compare_wake_time, NULL);  // Add the thread to the sleeping list in the right order based on wake-up time.
+
+    sema_down(&st.t->sema);  // Block the thread by downing the semaphore.
+
+    intr_set_level(old_level);  // Restore interrupt level.
 }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -167,11 +202,28 @@ timer_print_stats (void)
 }
 
 /* Timer interrupt handler. */
-static void
+/*static void
 timer_interrupt (struct intr_frame *args UNUSED)
 {
   ticks++;
   thread_tick ();
+}*/
+
+/* This function runs in the timer interrupt handler to wake up sleeping threads. */
+void timer_interrupt(void) {
+    int64_t current_time = timer_ticks();  // Get the current time.
+
+    while (!list_empty(&sleeping_list)) {
+        struct list_elem *e = list_front(&sleeping_list);
+        struct sleeping_thread *st = list_entry(e, struct sleeping_thread, elem);
+
+        if (st->wake_up_time > current_time) {
+            break;  // No threads to wake up yet.
+        }
+
+        list_pop_front(&sleeping_list);  // Remove the thread from the sleeping list.
+        sema_up(&st->t->sema);  // Wake up the thread by upping its semaphore.
+    }
 }
 
 /* Returns true if LOOPS iterations waits for more than one timer
